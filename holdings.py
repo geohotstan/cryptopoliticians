@@ -1,23 +1,40 @@
 from typing import Union
 from dataclasses import dataclass
 from bs4 import BeautifulSoup
-from pathlib import Path
 from pdf2image import convert_from_bytes
+from tqdm import tqdm
+import zipfile
+import io
 import json
 import requests
 
-BASE_DATA_FP = Path(__file__).resolve().parent / 'data'
+from utils import HOR_DATA_FP, SENATE_DATA_FP, update_holding_json, remove_directory
+from members import Member
 
 # =============================================
 # ========= House of Representatives ==========
 # =============================================
 # https://disclosures-clerk.house.gov/
 
-HOR_DATA_FP = BASE_DATA_FP / 'house_of_representatives'
+def download_zip(year: int):
+    url = f"https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
+    unzip_folder = HOR_DATA_FP / f"{year}FD"
+    unzip_folder.mkdir(parents=True, exist_ok=True)
+
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise requests.HTTPError(f"Failed to download from {url}")
+
+    zip_content = io.BytesIO(response.content)
+    with zipfile.ZipFile(zip_content, "r") as zip_ref:
+        zip_ref.extractall(unzip_folder)
+
+    print(f"Extracted files to {unzip_folder}")
+
 
 def load_HoR_FD_XML(year: int) -> list[dict]:
     xml_fp = HOR_DATA_FP / f'{year}FD/{year}FD.xml'
-    assert xml_fp.exists(), f'need to download from https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip extracted and copied to data/'
+    assert xml_fp.exists()
 
     with open(xml_fp, 'r') as file:
         content = file.read()
@@ -29,43 +46,64 @@ def load_HoR_FD_XML(year: int) -> list[dict]:
 
     # NOTE: 'FilingType': 'O' refers to Annual Report
     fds = [fd for fd in fds if fd['FilingType'] == 'O']
+    assert len(fds) != 0, f"there are no Annual Reports for House of Representatives for {year=}"
+
+    # remove the FD stuff
+    remove_directory(HOR_DATA_FP / f'{year}FD')
 
     return fds
 
 
 def save_HoR_FD_PDF(year: int, fds: list[dict]):
-    fp = HOR_DATA_FP / f'reports/{year}'
-    fp.mkdir(parents=True, exist_ok=True)
+    desc = "Processing financial disclosures for members in House of Representatives"
+    not_saved = []
+    for disclosure in tqdm(fds, desc=desc):
 
-    for fd in fds:
         # unpack
-        last_name = fd['Last']
-        first_name = fd['First']
-        doc_id = fd['DocID']
-        year = fd['Year']
-        filing_date = fd['FilingDate'].replace('/', '-')
+        last_name = disclosure['Last'].upper()
+        first_name = disclosure['First'].upper()
+        doc_id = disclosure['DocID']
+        year = disclosure['Year']
+        filing_date = disclosure['FilingDate'].replace('/', '-')
+        pdf_link = f'https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}/{doc_id}.pdf'
+
+        member_fp = HOR_DATA_FP / f"{last_name}, {first_name}"
+
+        # skip if the member isn't already in data
+        if not member_fp.exists():
+            not_saved.append(member_fp.name)
+            print(f"{member_fp.name} skipped, not in current congress")
+            continue
 
         # create folder for member and create a folder to store images
-        member_fp = fp / f"{last_name}_{first_name}"
-        member_fp.mkdir(parents=True, exist_ok=True)
-        images_fp = member_fp / "imgs"
+        disclosure_id = f"{doc_id}"
+        images_fp = member_fp / disclosure_id
         images_fp.mkdir(parents=True, exist_ok=True)
 
-        # download pdf and save it in folder
-        pdf_url = f'https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}/{doc_id}.pdf'
-
-        response = requests.get(pdf_url)
+        response = requests.get(pdf_link)
         if response.status_code != 200:
-            raise requests.HTTPError(f"Failed to download {pdf_url}")
+            raise requests.HTTPError(f"Failed to download {pdf_link}")
 
         images = convert_from_bytes(response.content)
+
         for i, image in enumerate(images):
             image_fp = images_fp / f"{filing_date}_{i}.jpg"
             image.save(image_fp, 'JPEG')
-        print(f"Finished saving {i} images from {last_name}, {first_name} to {images_fp}")
+
+        # dump member json info
+        json_data = {disclosure_id: {"data": [], "link": pdf_link, "date": filing_date}}
+        json_fp = member_fp / f"{member_fp.name}.json"
+        update_holding_json(json_fp, json_data)
+
+        print(f"Finished saving {len(images)} images from {last_name}, {first_name} to {images_fp}")
+    return not_saved
 
 
 def scrape_house_of_representatives(year: int):
+    # download FD description
+    download_zip(year=year)
+
+    # scrape and load financial disclosures
     fds = load_HoR_FD_XML(year=year)
 
     # save to data/house_of_representatives/{year}
@@ -81,8 +119,6 @@ ROOT = 'https://efdsearch.senate.gov'
 LANDING_PAGE_URL = f'{ROOT}/search/home/'
 SEARCH_PAGE_URL = f'{ROOT}/search/'
 REPORTS_URL = f'{ROOT}/search/report/data/'
-PDF_PREFIX = '/search/view/paper/'
-SENATE_DATA_FP = BASE_DATA_FP / 'senate'
 
 BATCH_SIZE = 100
 
@@ -141,15 +177,13 @@ def reports_api(client: requests.Session, offset: int, token: str, year: int) ->
     return response.json()['data']
 
 
-def disclosure_api(client: requests.Session, member: SenateMember, href_link: str):
-    full_url = ROOT + href_link
+def disclosure_api(client: requests.Session, member: SenateMember, full_url: str):
     response = client.get(full_url)
 
     webpage_soup = BeautifulSoup(response.text, 'html.parser')
 
     # if the disclosure is scanned, we just fetch the images
     if member.is_scanned:
-        # TODO: get assets
         gif_urls = [img['src'] for img in webpage_soup.find_all('img', class_='filingImage')]
         responses = [client.get(url) for url in gif_urls]
         if any(response.status_code != 200 for response in responses):
@@ -176,13 +210,16 @@ def disclosure_api(client: requests.Session, member: SenateMember, href_link: st
     return ret
 
 
-def scrape_and_save_disclosure(client: requests.Session, year:int, reports:list[SenateMember]):
-    fp = SENATE_DATA_FP / f'reports/{year}'
-    fp.mkdir(parents=True, exist_ok=True)
+def scrape_and_save_disclosure(client: requests.Session, reports:list[SenateMember]):
+    desc = "Processing financial disclosures for members in Senate"
+    not_saved = []
+    for disclosure in tqdm(reports, desc=desc):
+        disclosure_fp = SENATE_DATA_FP / f"{disclosure.last_name}, {disclosure.first_name}"
 
-    for disclosure in reports:
-        disclosure_fp = fp / f"{disclosure.last_name}_{disclosure.first_name}"
-        disclosure_fp.mkdir(parents=True, exist_ok=True)
+        if not disclosure_fp.exists():
+            not_saved.append(disclosure_fp.name)
+            print(f"{disclosure_fp.name} skipped, not in current congress")
+            continue
 
         # Find the <a> tag and extract the href attribute
         link_soup = BeautifulSoup(disclosure.html, 'html.parser')
@@ -190,39 +227,44 @@ def scrape_and_save_disclosure(client: requests.Session, year:int, reports:list[
         href_link = a_tag['href']
         disclosure_name = a_tag.text
 
-        member_diclosure: list[Union[bytes, dict]] = disclosure_api(client, disclosure, href_link)
+        full_url = ROOT + href_link
+        member_diclosure: list[Union[bytes, dict]] = disclosure_api(client, disclosure, full_url)
 
         if disclosure.is_scanned:
             assert all(isinstance(f, bytes) for f in member_diclosure), \
-            f"datatype is wrong for {disclosure.last_name} {disclosure.first_name} {disclosure.html}"
+            f"datatype is wrong for {disclosure.html}"
 
             # create a folder to store images
-            images_fp = disclosure_fp / "imgs"
+            images_fp = disclosure_fp / disclosure_name
             images_fp.mkdir(parents=True, exist_ok=True)
 
             for i, f in enumerate(member_diclosure):
-                file_fp = images_fp / f"{disclosure_name}_{disclosure.date}_{i}.gif"
+                file_fp = images_fp / f"{disclosure.date}_{i}.gif"
                 with open(file_fp, "wb") as file:
                     file.write(f)
+
+            json_data = {disclosure_name: {"data": [], "link": full_url, "date": disclosure.date}}
+            json_fp = disclosure_fp / f"{disclosure_fp.name}.json"
+            update_holding_json(json_fp, json_data)
 
             print(f"Finished saving {i} images from {disclosure.last_name}, {disclosure.first_name} to {images_fp}")
         else:
             assert all(isinstance(f, dict) for f in member_diclosure), \
-            f"datatype is wrong for {disclosure.last_name} {disclosure.first_name} {disclosure.html}"
+            f"datatype is wrong for {disclosure.html}"
 
-            file_fp = disclosure_fp / f"{disclosure_name}_{disclosure.date}.json"
-            with open(file_fp, "w") as file:
-                json.dump({f"{disclosure.last_name}_{disclosure.first_name}": member_diclosure}, file)
+            json_data = {disclosure_name: {"data": member_diclosure, "link": full_url, "date": disclosure.date}}
+            json_fp = disclosure_fp / f"{disclosure_fp.name}.json"
+            update_holding_json(json_fp, json_data)
 
-            print(f"Finished saving json from {disclosure.last_name}, {disclosure.first_name} to {file_fp}")
-
+            print(f"Finished saving json from {disclosure.last_name}, {disclosure.first_name} to {disclosure_fp}")
+    return not_saved
 
 
 def scrape_senate(year: int):
     def _filter(reports: list[list[str]]) -> list[SenateMember]:
         return [SenateMember(
-            first_name=report[0].title(),
-            last_name=report[1].title(),
+            first_name=report[0].upper(),
+            last_name=report[1].upper(),
             html=report[3],
             date=report[4].replace("/", "-"),
             is_scanned= "for CY" not in report[3]
@@ -241,17 +283,16 @@ def scrape_senate(year: int):
 
     all_reports = _filter(all_reports)
 
-    scrape_and_save_disclosure(client, year, all_reports)
-
-
+    scrape_and_save_disclosure(client, all_reports)
 
 
 if __name__ == "__main__":
-    # grab for year
     year = 2022
 
     # House of Representatives
+    # -> /data/house_of_representatives/reports/{year}
     scrape_house_of_representatives(year)
 
     # Senate
+    # -> /data/senate/reports/{year}
     scrape_senate(year)
