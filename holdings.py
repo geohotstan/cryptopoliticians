@@ -8,8 +8,18 @@ import io
 import json
 import requests
 
-from utils import HOR_DATA_FP, SENATE_DATA_FP, update_holding_json, remove_directory
+from utils import (
+    HOR_DATA_FP,
+    SENATE_DATA_FP,
+    update_holding_json,
+    remove_directory,
+    standardize_name,
+    interchange_name,
+    house_last_names, senate_last_names
+)
 from members import Member
+
+
 
 # =============================================
 # ========= House of Representatives ==========
@@ -46,38 +56,48 @@ def load_HoR_FD_XML(year: int) -> list[dict]:
 
     # NOTE: 'FilingType': 'O' refers to Annual Report
     fds = [fd for fd in fds if fd['FilingType'] == 'O']
-    assert len(fds) != 0, f"there are no Annual Reports for House of Representatives for {year=}"
+
+    if len(fds) == 0:
+        raise RuntimeError(f"there are no Annual Reports for House of Representatives for {year=}")
 
     # remove the FD stuff
     remove_directory(HOR_DATA_FP / f'{year}FD')
+    print(f"Removed files from {HOR_DATA_FP / f'{year}FD'}")
 
     return fds
 
-
 def save_HoR_FD_PDF(year: int, fds: list[dict]):
-    desc = "Processing financial disclosures for members in House of Representatives"
-    not_saved = []
+    desc = "Scraping financial disclosures for members in House of Representatives"
+    missed = []
+    hit = []
+    unsure = []
+    last_names = house_last_names()
     for disclosure in tqdm(fds, desc=desc):
-
         # unpack
-        last_name = disclosure['Last'].upper()
-        first_name = disclosure['First'].upper()
+        last_name = standardize_name(disclosure['Last'])
+        first_name = standardize_name(disclosure['First'])
+        last_name, first_name = interchange_name(f"{last_name}, {first_name}").split(",")
+        first_name = first_name.strip()
+        last_name = last_name.strip()
+
         doc_id = disclosure['DocID']
         year = disclosure['Year']
         filing_date = disclosure['FilingDate'].replace('/', '-')
         pdf_link = f'https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}/{doc_id}.pdf'
 
-        member_fp = HOR_DATA_FP / f"{last_name}, {first_name}"
+        key = f"{last_name}, {first_name}"
+        member_fp = HOR_DATA_FP / key
 
-        # skip if the member isn't already in data
+        # missed
         if not member_fp.exists():
-            not_saved.append(member_fp.name)
-            print(f"{member_fp.name} skipped, not in current congress")
+            missed.append(member_fp.name)
+            # unsure
+            if last_name in last_names:
+                unsure.append((f"{last_name}, {first_name}", last_names[last_name]))
             continue
 
         # create folder for member and create a folder to store images
-        disclosure_id = f"{doc_id}"
-        images_fp = member_fp / disclosure_id
+        images_fp = member_fp / doc_id
         images_fp.mkdir(parents=True, exist_ok=True)
 
         response = requests.get(pdf_link)
@@ -91,15 +111,19 @@ def save_HoR_FD_PDF(year: int, fds: list[dict]):
             image.save(image_fp, 'JPEG')
 
         # dump member json info
-        json_data = {disclosure_id: {"data": [], "link": pdf_link, "date": filing_date}}
+        json_data = {doc_id: {"data": [], "link": pdf_link, "date": filing_date}}
         json_fp = member_fp / f"{member_fp.name}.json"
         update_holding_json(json_fp, json_data)
 
-        print(f"Finished saving {len(images)} images from {last_name}, {first_name} to {images_fp}")
-    return not_saved
+        hit.append(member_fp.name)
+
+    print(f"hit: {sorted(hit)}")
+    print(f"missed: {sorted(missed)}")
+
+    return unsure
 
 
-def scrape_house_of_representatives(year: int):
+def scrape_house_of_representatives(year: int) -> list:
     # download FD description
     download_zip(year=year)
 
@@ -107,7 +131,8 @@ def scrape_house_of_representatives(year: int):
     fds = load_HoR_FD_XML(year=year)
 
     # save to data/house_of_representatives/{year}
-    save_HoR_FD_PDF(year=year, fds=fds)
+    unsure = save_HoR_FD_PDF(year=year, fds=fds)
+    return unsure
 
 
 # ===========================
@@ -129,7 +154,6 @@ class SenateMember:
     html: str
     date: str
     is_scanned: bool
-
 
 def _csrf(client: requests.Session) -> str:
     """ Set the session ID and return the CSRF token for this session. """
@@ -176,7 +200,6 @@ def reports_api(client: requests.Session, offset: int, token: str, year: int) ->
                            headers={'Referer': SEARCH_PAGE_URL})
     return response.json()['data']
 
-
 def disclosure_api(client: requests.Session, member: SenateMember, full_url: str):
     response = client.get(full_url)
 
@@ -199,7 +222,7 @@ def disclosure_api(client: requests.Session, member: SenateMember, full_url: str
         cells = row.find_all('td')
         asset_data = {
         'Asset': cells[1].find('strong').text.strip(), # strong -> only get bolded Asset title (no asset description)
-        'Asset Type': cells[2].get_text(separator=" ").strip(),
+        'Asset Type': cells[2].get_text(separator=" ").strip()[:-1],
         'Owner': cells[3].text.strip(),
         'Value': cells[4].text.strip(),
         'Income Type': cells[5].text.strip(),
@@ -210,15 +233,22 @@ def disclosure_api(client: requests.Session, member: SenateMember, full_url: str
     return ret
 
 
-def scrape_and_save_disclosure(client: requests.Session, reports:list[SenateMember]):
-    desc = "Processing financial disclosures for members in Senate"
-    not_saved = []
+def scrape_and_save_disclosure(client: requests.Session, reports:list[SenateMember]) -> list:
+    desc = "Scraping financial disclosures for members in Senate"
+    hit = []
+    missed = []
+    unsure = []
+    last_names = senate_last_names()
     for disclosure in tqdm(reports, desc=desc):
-        disclosure_fp = SENATE_DATA_FP / f"{disclosure.last_name}, {disclosure.first_name}"
+        key = f"{disclosure.last_name}, {disclosure.first_name}"
+        disclosure_fp = SENATE_DATA_FP / key
 
+        # missed
         if not disclosure_fp.exists():
-            not_saved.append(disclosure_fp.name)
-            print(f"{disclosure_fp.name} skipped, not in current congress")
+            missed.append(disclosure_fp.name)
+            # unsure
+            if disclosure.last_name in last_names:
+                unsure.append((f"{disclosure.last_name}, {disclosure.first_name}", last_names[disclosure.last_name]))
             continue
 
         # Find the <a> tag and extract the href attribute
@@ -246,8 +276,6 @@ def scrape_and_save_disclosure(client: requests.Session, reports:list[SenateMemb
             json_data = {disclosure_name: {"data": [], "link": full_url, "date": disclosure.date}}
             json_fp = disclosure_fp / f"{disclosure_fp.name}.json"
             update_holding_json(json_fp, json_data)
-
-            print(f"Finished saving {i} images from {disclosure.last_name}, {disclosure.first_name} to {images_fp}")
         else:
             assert all(isinstance(f, dict) for f in member_diclosure), \
             f"datatype is wrong for {disclosure.html}"
@@ -256,19 +284,29 @@ def scrape_and_save_disclosure(client: requests.Session, reports:list[SenateMemb
             json_fp = disclosure_fp / f"{disclosure_fp.name}.json"
             update_holding_json(json_fp, json_data)
 
-            print(f"Finished saving json from {disclosure.last_name}, {disclosure.first_name} to {disclosure_fp}")
-    return not_saved
+        hit.append(disclosure_fp.name)
 
+    print(f"hit: {sorted(hit)}")
+    print(f"missed: {sorted(missed)}")
+
+    return unsure
 
 def scrape_senate(year: int):
     def _filter(reports: list[list[str]]) -> list[SenateMember]:
-        return [SenateMember(
-            first_name=report[0].upper(),
-            last_name=report[1].upper(),
-            html=report[3],
-            date=report[4].replace("/", "-"),
-            is_scanned= "for CY" not in report[3]
-        ) for report in reports if "Senator" in report[2]]
+        ret = []
+        for report in reports:
+            if "Senator" in report[2]:
+                first_name = standardize_name(report[0])
+                last_name = standardize_name(report[1])
+                last_name, first_name = interchange_name(f"{last_name}, {first_name}").split(",")
+                ret.append(SenateMember(
+                    first_name=first_name.strip(),
+                    last_name=last_name.strip(),
+                    html=report[3],
+                    date=report[4].replace("/", "-"),
+                    is_scanned= "for CY" not in report[3]
+                ))
+        return ret
 
     client = requests.Session()
 
@@ -283,7 +321,8 @@ def scrape_senate(year: int):
 
     all_reports = _filter(all_reports)
 
-    scrape_and_save_disclosure(client, all_reports)
+    unsure = scrape_and_save_disclosure(client, all_reports)
+    return unsure
 
 
 if __name__ == "__main__":
@@ -291,8 +330,11 @@ if __name__ == "__main__":
 
     # House of Representatives
     # -> /data/house_of_representatives/reports/{year}
-    scrape_house_of_representatives(year)
+    unsure = scrape_house_of_representatives(year)
 
     # Senate
     # -> /data/senate/reports/{year}
-    scrape_senate(year)
+    unsure.extend(scrape_senate(year))
+
+    for name_1, name_2 in unsure:
+        print(name_1, " <=> ", name_2)
