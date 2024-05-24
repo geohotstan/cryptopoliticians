@@ -1,4 +1,3 @@
 __pycache__
-*.jpg
-data/*.json
+data/*
 .DS_store
